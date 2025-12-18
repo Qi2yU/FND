@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from src.utils import data2gpu, Averager, Recorder
 from src.loss import *
 from src.models.multimodal import *
+from transformers import get_cosine_schedule_with_warmup
 # Import other models as needed
 
 
@@ -24,7 +25,7 @@ class Trainer:
         self._init_model()
         self._init_optimizer()
         self._init_criterion()
-        self._init_scheduler()
+        # self._init_scheduler() # Moved to fit() to access train_loader size
         
         self.recorder = Recorder(config['early_stop'])
         
@@ -60,18 +61,17 @@ class Trainer:
             weight_decay=self.config.get('weight_decay', 5e-5)
         )
 
-    def _init_scheduler(self):
-        # 从 config 中读取调度器参数，如果未提供则使用默认值
-        scheduler_params = self.config.get('scheduler', {
-            'mode': 'max',      # 'max' 表示当监控指标不再上升时降低LR
-            'factor': 0.5,      # 学习率衰减因子
-            'patience': 3,      # 容忍多少个epoch指标不提升
-            'min_lr': 1e-6      # 最小学习率
-        })
+    def _init_scheduler(self, num_training_steps):
+        # 使用带预热的余弦退火调度器
+        warmup_ratio = self.config.get('warmup_ratio', 0.1)
+        num_warmup_steps = int(num_training_steps * warmup_ratio)
         
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        self.logger.info(f"Initializing Cosine Schedule with Warmup: Total Steps={num_training_steps}, Warmup Steps={num_warmup_steps}")
+        
+        self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
-            **scheduler_params
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
         )
 
     def _init_criterion(self):
@@ -205,6 +205,7 @@ class Trainer:
             # Gradient clipping to stabilize training and reduce overfitting from exploding updates
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.get('grad_clip', 1.0))
             self.optimizer.step()
+            self.scheduler.step()
             
             avg_loss.add(loss.item())
             avg_cls_loss.add(cls_loss.item())
@@ -328,6 +329,10 @@ class Trainer:
     def fit(self, train_loader, val_loader, test_loader=None):
         self.logger.info("Start training...")
         
+        # Initialize scheduler with total training steps
+        num_training_steps = len(train_loader) * self.config['epoch']
+        self._init_scheduler(num_training_steps)
+
         for epoch in range(self.config['epoch']):
             train_loss = self.train_epoch(train_loader, epoch)
             self.logger.info(f"Epoch {epoch} | Train Loss: {train_loss:.4f}")

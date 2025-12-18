@@ -1539,9 +1539,9 @@ class MModel_distangle_1(torch.nn.Module):
     
     def get_network(self, network_type='transformer', self_type='m', layers=2):
         if self_type in ['m', 'r']:
-            embed_dim, attn_dropout, layers = self.dim, self.config['model']['drop_out']['encoder'], self.config['model']['layer']['encoder']
+            embed_dim, attn_dropout, layers, use_ffn = self.dim, self.config['model']['drop_out']['encoder'], self.config['model']['layer']['encoder'], self.config['model']['use_ffn']['encoder']
         else:
-            embed_dim, attn_dropout, layers = self.dim, self.config['model']['drop_out'][self_type], self.config['model']['layer'][self_type]
+            embed_dim, attn_dropout, layers, use_ffn = self.dim, self.config['model']['drop_out'][self_type], self.config['model']['layer'][self_type], self.config['model']['use_ffn'][self_type]
 
         if network_type == 'conv':
             # 使用轻量级CNN编码器替换Transformer，保持接口与张量形状一致
@@ -1569,4 +1569,5 @@ class MModel_distangle_1(torch.nn.Module):
                 relu_dropout=self.config['model']['drop_out']["attn"]['relu'],
                 res_dropout=self.config['model']['drop_out']["attn"]['res'],
                 embed_dropout=self.config['model']['drop_out']["attn"]['embed'],
+                use_ffn=use_ffn
             )
