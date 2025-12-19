@@ -6,4 +6,4 @@ __pycache__/
 *.sh
 scrips/
 results/
-config/*
+config/
