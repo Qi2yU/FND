@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from src.utils import data2gpu, Averager, Recorder
 from src.loss import *
 from src.models.multimodal import *
+from src.models.ablation_model import *
 from transformers import get_cosine_schedule_with_warmup
 # Import other models as needed
 
@@ -48,6 +49,12 @@ class Trainer:
             self.model = MModel_distangle(self.config)
         elif model_name == 'distangle_1':
             self.model = MModel_distangle_1(self.config)
+        elif model_name == 'ablation_wo_r':
+            self.model = ablation_without_r(self.config)
+        elif model_name == "EARAM":
+            self.model = EARAM(self.config)
+        elif model_name == "style_distangle":
+            self.model = style_distangle(self.config)
         else:
             # Default model
             self.model = MModel_CE(self.config)
@@ -84,6 +91,8 @@ class Trainer:
             self.criterion_cosine = nn.CosineEmbeddingLoss()
             self.criterion_contrast = SupervisedContrastiveLoss(temperature=self.config.get('contrastive_temperature', 0.07))
         # You can add more complex logic here if needed
+        elif self.model_name == "style_distangle":
+            self.criterion_cosine = nn.CosineEmbeddingLoss()
         self.logger.info("Loss functions initialized.")
 
     def compute_loss(self, res, batch_data):
@@ -167,6 +176,21 @@ class Trainer:
                 'recon_specific': loss_recon_specific.item(),
                 'ort': loss_ort.item(),
                 'contrastive': loss_contrast.item()
+            }
+        elif self.model_name == 'ablation_wo_r':
+            loss = loss_classify
+        elif self.model_name == 'EARAM':
+            loss = self.config['model']['hyper_parameters']['1'] * loss_classify +\
+                   self.config['model']['hyper_parameters']['2'] * self.criterion_cls(res['label_2'], label) +\
+                   self.config['model']['hyper_parameters']['3'] * self.criterion_cls(res['label_3'], label)
+        elif self.model_name == "style_distangle":
+            dim = self.config['emb_dim']
+            loss_sim = self.criterion_cosine(res['pooled_1'].reshape(-1, dim), res['pooled_2'].reshape(-1, dim), torch.tensor([1]).to(self.device))
+            loss = loss_sim + self.config['model']['hyper_parameters']['sim'] * loss_classify
+
+            loss_info = {
+                'loss': loss.item(),
+                'sim': loss_sim.item()
             }
         else:
             # loss_rational_useful = self.criterion_bce(res['r1_useful'], label_r1_acc.float()) + self.criterion_bce(res['r2_useful'], label_r2_acc.float())

@@ -133,7 +133,7 @@ class TransformerEncoderLayer(nn.Module):
             self.fc2 = Linear(4*self.embed_dim, self.embed_dim)
         self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for _ in range(2)])  #Define two layer_norms layers
 
-    def forward(self, x, x_k=None, x_v=None):                                     #Two Transformer layers 
+    def forward(self, x, x_k=None, x_v=None, key_attn_mask=None):                                     #Two Transformer layers 
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -152,6 +152,8 @@ class TransformerEncoderLayer(nn.Module):
         else:
             x_k = self.maybe_layer_norm(0, x_k, before=True)
             x_v = self.maybe_layer_norm(0, x_v, before=True) 
+            if key_attn_mask is not None:
+                mask = key_attn_mask
             x, _ = self.self_attn(query=x, key=x_k, value=x_v, attn_mask=mask)
         x = F.dropout(x, p=self.res_dropout, training=self.training)
         x = residual + x

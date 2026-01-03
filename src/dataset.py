@@ -9,7 +9,7 @@ from transformers import BertTokenizer, AutoTokenizer, ChineseCLIPProcessor, Aut
 from pathlib import Path
 
 class FakenewsDataset(Dataset):
-    def __init__(self, data_path, image_root, text_tokenizer, rational_tokenizer, img_processor=None, text_max_len=170, rational_max_len=170, enable_reverse_label=True, mode='train'):
+    def __init__(self, data_path, image_root, text_tokenizer, rational_tokenizer, img_processor=None, text_max_len=170, rational_max_len=170, mode='train', indices=None):
         self.data = []
         self.image_root = image_root
         self.text_tokenizer = text_tokenizer
@@ -18,50 +18,36 @@ class FakenewsDataset(Dataset):
         self.text_max_len = text_max_len
         self.rational_max_len = rational_max_len
         self.mode = mode
-        self.enable_reverse_label = enable_reverse_label
-        self.label_map = {
-            "real": 0, "fake": 1,
-            0: 1, 1: 0 # Original code mapping seems to flip 0 and 1 or handle mixed types? 
-                       # Wait, original code: 0:1, 1:0. This looks like a flip. 
-                       # Let's stick to the original logic to be safe, but document it.
-                       # Original: "real": 0, "fake": 1, 0: 1, 1: 0. 
-                       # If input is "real" -> 0. If input is 1 -> 0. 
-                       # If input is "fake" -> 1. If input is 0 -> 1.
-                       # This implies 0 in json might mean "real" (mapped to 1?) or "fake"?
-                       # Let's look at original code again.
-                       # label_dict = {"real": 0, "fake": 1, 0: 1, 1: 0}
-                       # If json has 0, it becomes 1. If json has 1, it becomes 0.
-                       # If json has "real", it becomes 0.
-                       # This is confusing. I will preserve it but add a comment.
-        }
-        
-        self.label_map_ftr = {
-            "real": 0, "fake": 1, "other": 2,
-            0: 1, 1: 0, 2: 2
-        }
+        self.indices = indices
 
         self._load_data(data_path)
 
     def _load_data(self, path):
         print(f"Loading data from {path}...")
+        raw_data = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 if not line.strip():
                     continue
                 item = json.loads(line)
-                
-                # Check image existence if image processor is provided
-                if self.img_processor:
-                    img_name = item.get('image')
-                    if not img_name:
-                        continue
-                    img_path = os.path.join(self.image_root, img_name)
-                    if not os.path.exists(img_path):
-                        # print(f"Warning: Image not found: {img_path}")
-                        continue
-                    item['img_path'] = img_path
+                raw_data.append(item)
+        
+        if self.indices is not None:
+            raw_data = [raw_data[i] for i in self.indices]
 
-                self.data.append(item)
+        for item in raw_data:
+            # Check image existence if image processor is provided
+            if self.img_processor:
+                img_name = item.get('image')
+                if not img_name:
+                    continue
+                img_path = os.path.join(self.image_root, img_name)
+                if not os.path.exists(img_path):
+                    # print(f"Warning: Image not found: {img_path}")
+                    continue
+                item['img_path'] = img_path
+
+            self.data.append(item)
         print(f"Loaded {len(self.data)} samples.")
 
     def __len__(self):
@@ -84,8 +70,7 @@ class FakenewsDataset(Dataset):
         attention_mask = inputs['attention_mask'].squeeze(0)
 
         # 2. Process Label
-        raw_label = item['label']
-        label = self.label_map.get(raw_label, 0) if self.enable_reverse_label else raw_label # Default to 0 if not found, but should be found
+        label = item['label']
 
         # 3. Process Auxiliary Features (Rationale)
         # Using .get() with defaults to handle missing keys safely
@@ -109,7 +94,6 @@ class FakenewsDataset(Dataset):
         
         # rational_1_acc = int(item.get('rational_1_acc'))
         # rational_2_acc = int(item.get('rational_2_acc'))
-
         sample = {
             'content': input_ids,
             'content_masks': attention_mask,
@@ -121,12 +105,34 @@ class FakenewsDataset(Dataset):
             'r2': rational_2_ids,
             'r2_masks': rational_2_mask,
             
-            # 'rational_1_pred': torch.tensor(rational_1_pred, dtype=torch.long),
-            # 'rational_2_pred': torch.tensor(rational_2_pred, dtype=torch.long),
-            # 'rational_1_acc': torch.tensor(rational_1_acc, dtype=torch.long),
-            # 'rational_2_acc': torch.tensor(rational_2_acc, dtype=torch.long),
         }
 
+        if 'content_rewrite' in item:
+            content_rewrite = item['content_rewrite']
+            neutral_input = self.text_tokenizer(
+                content_rewrite,
+                max_length=self.text_max_len,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+
+            sample['content_neutral'] = neutral_input['input_ids'].squeeze(0)
+            sample['content_neutral_masks'] = neutral_input['attention_mask'].squeeze(0)
+            
+        
+
+        # sample = {
+        #     'content': input_ids,
+        #     'content_masks': attention_mask,
+        #     'label': torch.tensor(label, dtype=torch.long),
+        #     'id': str(item.get('id', item.get('source_id', ''))),
+            
+        #     'r1': input_ids,
+        #     'r1_masks': attention_mask,
+        #     'r2': input_ids,
+        #     'r2_masks': attention_mask,
+        # }
         # 5. Process Image
         # if self.img_processor:
             
@@ -187,11 +193,20 @@ def create_dataloader(config, mode='train'):
     # Original logic: get_monthly_path(data_type, root_path, 'train.jsonl')
     # We simplify: assume standard names or config provided names
     
+    indices = None
     if mode == 'train':
-        file_name = 'train.jsonl'
+        if 'train_indices' in config:
+            indices = config['train_indices']
+            file_name = 'train.jsonl'
+        else:
+            file_name = 'train.jsonl'
         shuffle = True
     elif mode == 'val':
-        file_name = 'val.jsonl'
+        if 'val_indices' in config:
+            indices = config['val_indices']
+            file_name = 'train.jsonl'
+        else:
+            file_name = 'val.jsonl'
         shuffle = False
     else:
         file_name = 'test.jsonl'
@@ -217,8 +232,6 @@ def create_dataloader(config, mode='train'):
     # We should make this configurable
     image_root = config.get('image_root', '/data01/qy/fakenews/Dataset/weibo')
 
-    enable_reverse_label = True if 'enable_reverse_label' in config else False
-
     dataset = FakenewsDataset(
         data_path=file_path,
         image_root=image_root,
@@ -227,8 +240,8 @@ def create_dataloader(config, mode='train'):
         img_processor=img_processor,
         text_max_len=config['text_max_len'],
         rational_max_len=config['rational_max_len'],
-        enable_reverse_label=enable_reverse_label,
-        mode=mode
+        mode=mode,
+        indices=indices
     )
 
     dataloader = DataLoader(

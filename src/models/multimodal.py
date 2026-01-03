@@ -7,6 +7,7 @@ from sklearn.metrics import *
 from transformers import BertModel, ChineseCLIPModel, AutoModel
 from .transformers_encoder.transformer import TransformerEncoder
 from .transformers_encoder.lightweight_cnn_encoder import LightweightConvEncoder
+from .transformers_encoder.my_transformers import TransformerBlock, mm_fusion, CoAttention_my
 import pdb
 
 class MModel(torch.nn.Module):
@@ -1256,7 +1257,89 @@ class MModel_distangle(torch.nn.Module):
             
         }
         return res, debug_info
-    
+
+class EARAM(torch.nn.Module):
+    def __init__(self, config):
+        super(EARAM, self).__init__()
+        self.config = config
+        self.cross_layer_1 = MultiHeadCrossAttention(model_dim=config['emb_dim'], num_heads=8, dropout=0.5)
+        self.co_layer_1 = CoAttention(model_dim=config['emb_dim'], num_heads=8, dropout=0.5)
+        self.cross_layer_2 = MultiHeadCrossAttention(model_dim=config['emb_dim'], num_heads=8, dropout=0.5)
+        self.co_layer_2 = CoAttention(model_dim=config['emb_dim'], num_heads=8, dropout=0.5)
+        
+        # Define a learnable parameter for the weighted sum
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+
+        self.mlp = EARAM_MLP(in_features=config['emb_dim'], out_features=2)
+        self.sim_mlp_1 = simple_mlp(in_features=config['emb_dim'])
+        self.sim_mlp_2 = simple_mlp(in_features=config['emb_dim'])
+
+        self.bert_content = AutoModel.from_pretrained(config['text_encoder_path']).requires_grad_(False)
+        self.bert_FTR = AutoModel.from_pretrained(config['rational_encoder_path']).requires_grad_(False)
+        # self.clip = AutoModel.from_pretrained(config['img_encoder_path']).requires_grad_(False)
+        if config['img_encoder'] == "swinT":
+            self.img_encoder = AutoModel.from_pretrained(config['img_encoder_path']).requires_grad_(False)
+            self.visual_dim = self.img_encoder.config.hidden_size
+        else:
+            self.img_encoder = AutoModel.from_pretrained(config['img_encoder_path']).requires_grad_(False)
+            self.visual_dim = self.img_encoder.config.projection_dim
+
+        self.bert_dim = config['emb_dim']
+        self.image_projection = nn.Sequential(
+            nn.Linear(self.visual_dim, self.bert_dim),
+            nn.LayerNorm(self.bert_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, **kwargs):
+        # pdb.set_trace()
+        content, content_masks = kwargs['content'], kwargs['content_masks']
+        image = kwargs['img']
+
+        r1, r1_masks = kwargs['r1'], kwargs['r1_masks']
+        r2, r2_masks = kwargs['r2'], kwargs['r2_masks']
+
+        r1_feature = self.bert_FTR(r1, attention_mask = r1_masks)[0] # (bs, seq_len, bert_dim)
+        r2_feature = self.bert_FTR(r2, attention_mask = r2_masks)[0]
+        
+        content_feature = self.bert_content(content, attention_mask = content_masks)[0]
+        if self.config['img_encoder'] == "clip":
+            image_feature = self.img_encoder.visual_projection(self.img_encoder.vision_model(image).last_hidden_state) # [batch, seq_len_img, clip_dim]
+        elif self.config['img_encoder'] == "swinT":
+            image_feature = self.img_encoder(image).last_hidden_state
+
+        image_feature = self.image_projection(image_feature) # [batch, seq_len_img, bert_dim]
+
+        x1, x2, x3, x4 = content_feature, image_feature, r1_feature, r2_feature
+        x1, x2 = self.cross_layer_1(x1, x2)
+        
+        fusion_1,fusion_high_dim = self.co_layer_1(x1, x2) # (bs, dim), (bs, text_len, dim)
+        
+        x3,_ = self.cross_layer_2(x3, fusion_high_dim)
+        
+        x4,_ = self.cross_layer_2(x4, fusion_high_dim)
+        
+        fusion_2,_ = self.co_layer_2(x3, x4)
+        
+        # Weighted sum of fusion_1 and fusion_2
+
+        output = self.alpha * fusion_1 + (1 - self.alpha) * fusion_2
+        
+        output = self.mlp(output)
+        output = F.softmax(output, dim=-1)
+        
+        output_1 = self.sim_mlp_1(x3)
+        output_2 = self.sim_mlp_2(x4)
+        
+        res = {
+            "classify_pred":output,
+            "label_2":output_1,
+            "label_3":output_2            
+        }
+
+        debug_info = None
+        return res, debug_info
+
 class MModel_distangle_1(torch.nn.Module):
     def __init__(self, config):
         super(MModel_distangle_1, self).__init__()
@@ -1571,3 +1654,100 @@ class MModel_distangle_1(torch.nn.Module):
                 embed_dropout=self.config['model']['drop_out']["attn"]['embed'],
                 use_ffn=use_ffn
             )
+
+class style_distangle(torch.nn.Module):
+    def __init__(self, config):
+        super(style_distangle, self).__init__()
+        self.config = config
+        
+        self.bert_content = AutoModel.from_pretrained(config['text_encoder_path']).requires_grad_(False)
+        self.bert_FTR = AutoModel.from_pretrained(config['rational_encoder_path']).requires_grad_(False)
+        # self.clip = AutoModel.from_pretrained(config['img_encoder_path']).requires_grad_(False)
+        if config['img_encoder'] == "swinT":
+            self.img_encoder = AutoModel.from_pretrained(config['img_encoder_path']).requires_grad_(False)
+            self.visual_dim = self.img_encoder.config.hidden_size
+        else:
+            self.img_encoder = AutoModel.from_pretrained(config['img_encoder_path']).requires_grad_(False)
+            self.visual_dim = self.img_encoder.config.projection_dim
+
+        self.bert_dim = config['emb_dim']
+        self.image_projection = nn.Sequential(
+            nn.Linear(self.visual_dim, self.bert_dim),
+            nn.LayerNorm(self.bert_dim),
+            nn.ReLU()
+        )
+
+        #### distangle gate
+        self.gate_distangle = TransformerBlock(d_model=config['emb_dim'], num_heads=8, use_ffn=True)
+            
+        # content_feature_pooling = LightweightAttentionPooling(input_dim=self.dim, dropout=self.config['model']['drop_out']['pooling'])
+
+        self.pooling_1 = LightweightAttentionPooling(input_dim=config['emb_dim'], dropout=self.config['model']['drop_out']['pooling'])
+        self.pooling_2 = LightweightAttentionPooling(input_dim=config['emb_dim'], dropout=self.config['model']['drop_out']['pooling'])
+        
+        self.neutral_img_fusion = mm_fusion(dim=config['emb_dim'], num_heads=8, dropout=0.5)
+        self.style_img_fusion = mm_fusion(dim=config['emb_dim'], num_heads=8, dropout=0.5)
+
+        self.neutral_fusion_weight = nn.Parameter(torch.tensor(0.5))
+
+        self.r1_fusion = TransformerBlock(d_model=config['emb_dim'], num_heads=8)
+        self.r2_fusion = TransformerBlock(d_model=config['emb_dim'], num_heads=8)
+        self.r_all_fusion = CoAttention_my(model_dim=config['emb_dim'], num_heads=8, dropout=0.5)
+
+        self.final_fusion_weight = nn.Parameter(torch.tensor(0.5))
+
+        self.classify_head = EARAM_MLP(in_features=config['emb_dim'], out_features=2)
+
+    def forward(self, **kwargs):
+        # pdb.set_trace()
+        content, content_masks = kwargs['content'], kwargs['content_masks']
+        content_neutral ,content_neutral_masks = kwargs['content_neutral'], kwargs['content_neutral_masks']
+        image = kwargs['img']
+
+        r1, r1_masks = kwargs['r1'], kwargs['r1_masks']
+        r2, r2_masks = kwargs['r2'], kwargs['r2_masks']
+
+        x_r1 = self.bert_FTR(r1, attention_mask = r1_masks)[0] # (bs, seq_len, bert_dim)
+        x_r2 = self.bert_FTR(r2, attention_mask = r2_masks)[0]
+        
+        x_content = self.bert_content(content, attention_mask = content_masks)[0]
+        x_content_neutral = self.bert_content(content_neutral, attention_mask = content_neutral_masks)[0]
+
+        if self.config['img_encoder'] == "clip":
+            image_feature = self.img_encoder.visual_projection(self.img_encoder.vision_model(image).last_hidden_state) # [batch, seq_len_img, clip_dim]
+        elif self.config['img_encoder'] == "swinT":
+            image_feature = self.img_encoder(image).last_hidden_state
+
+        x_image = self.image_projection(image_feature) # [batch, seq_len_img, bert_dim]
+
+        g_distangle = torch.sigmoid(self.gate_distangle(x_content, mask=content_masks))
+
+        content_neutral_distangle = x_content * g_distangle
+        content_style_distangle = x_content * (1 - g_distangle)
+
+        x_neutral_distangle_pooled, _ = self.pooling_1(content_neutral_distangle, mask=content_masks)
+        x_neutral_pooled, _ = self.pooling_2(x_content_neutral, mask=content_neutral_masks)
+
+        neutral_feature = content_neutral_distangle
+
+        _, mm_neutral = self.neutral_img_fusion(neutral_feature, x_image, mask1=content_masks, mask2=None)
+
+        mm_style, _ = self.style_img_fusion(content_style_distangle, x_image, mask1=content_masks, mask2=None)
+        
+        r1_neutral_fused = self.r1_fusion(mm_neutral, x_r1, x_r1, mask=r1_masks)
+        r2_neutral_fused = self.r2_fusion(mm_neutral, x_r2, x_r2, mask=r2_masks)
+        
+        r_neutral_fused, _ = self.r_all_fusion(r1_neutral_fused, r2_neutral_fused, mask1=content_masks, mask2=content_masks)
+
+        x_final = self.final_fusion_weight * r_neutral_fused + (1 - self.final_fusion_weight) * mm_style
+
+        output = self.classify_head(x_final)
+        
+        res = {
+            "classify_pred": output,
+            "pooled_1": x_neutral_pooled,
+            "pooled_2": x_neutral_distangle_pooled
+        }
+
+        debug_info = None
+        return res, debug_info

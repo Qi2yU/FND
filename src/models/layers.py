@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 import math
+import pdb
 # from timm.models.vision_transformer import Block
 
 class ReverseLayerF(Function):
@@ -123,7 +124,8 @@ class LightweightAttentionPooling(nn.Module):
         return: pooled (B, D), attn (B, 1, L)
         """
         L, B, D = x.shape
-        x_bld = x.transpose(0, 1)  # (B, L, D)
+        # x_bld = x.transpose(0, 1)  # (B, L, D)
+        x_bld = x
         h = self.ln(x_bld)
         scores = self.score(h).squeeze(-1)  # (B, L)
         if self.temperature != 1.0:
@@ -324,176 +326,6 @@ class EvidentialUsefulnessHead(nn.Module):
 
         return alpha, y_hat, u
     
-class multimodal_attention(nn.Module):
-    """
-    dot-product attention mechanism
-    """
-
-    def __init__(self, attention_dropout=0.5):
-        super(multimodal_attention, self).__init__()
-        self.dropout = nn.Dropout(attention_dropout)
-        self.softmax = nn.Softmax(dim=2)
-
-    def forward(self, q, k, v, scale=None, attn_mask=None):
-
-        attention = torch.matmul(q, k.transpose(-2, -1))
-        # print('attention.shape:{}'.format(attention.shape))
-        if scale:
-            attention = attention * scale
-
-        if attn_mask:
-            attention = attention.masked_fill_(attn_mask, -np.inf)
-            
-        attention = self.softmax(attention)
-        # print('attention.shftmax:{}'.format(attention))
-        attention = self.dropout(attention)
-        v_result = torch.matmul(attention, v)
-        # print('attn_final.shape:{}'.format(attention.shape))
-
-        return v_result
-    
-class CrossAttention(nn.Module):
-    """
-    Multi-Head Cross Attention mechanism
-    """
-
-    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
-        super(CrossAttention, self).__init__()
-
-        self.model_dim = model_dim
-        self.dim_per_head = model_dim // num_heads
-        self.num_heads = num_heads
-
-        self.linear_q = nn.Linear(model_dim, self.dim_per_head * num_heads, bias=False)
-        self.linear_k = nn.Linear(model_dim, self.dim_per_head * num_heads, bias=False)
-        self.linear_v = nn.Linear(model_dim, self.dim_per_head * num_heads, bias=False)
-
-        self.dot_product_attention = multimodal_attention(dropout)
-        self.linear_final = nn.Linear(model_dim, model_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(model_dim)
-
-    def forward(self, query, key, value, attn_mask=None):
-        residual = query
-
-        # Linear projection
-        query = self.linear_q(query)
-        key = self.linear_k(key)
-        value = self.linear_v(value)
-
-        # Split by heads
-        batch_size = query.size(0)
-        query = query.view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
-        key = key.view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
-        value = value.view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
-
-        # Scaled dot product attention
-        scale = (self.dim_per_head) ** -0.5
-        attention = self.dot_product_attention(query, key, value, scale, attn_mask)
-
-        # Concatenate heads
-        attention = attention.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.dim_per_head)
-
-        # Final linear projection
-        output = self.linear_final(attention)
-
-        # Dropout
-        output = self.dropout(output)
-
-        # Add residual and norm layer
-        output = self.layer_norm(residual + output)
-
-        return output
-    
-
-class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
-        super(MultiHeadCrossAttention, self).__init__()
-
-        self.model_dim = model_dim
-        self.dim_per_head = model_dim // num_heads
-        self.num_heads = num_heads
-
-        self.cross_attention = CrossAttention(model_dim, num_heads, dropout)
-        self.layer_norm = nn.LayerNorm(model_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x1, x2, attn_mask=None):
-        # Cross attention from x1 to x2
-        cross_attn_output_1 = self.cross_attention(x1, x2, x2, attn_mask)
-        # Cross attention from x2 to x1
-        cross_attn_output_2 = self.cross_attention(x2, x1, x1, attn_mask)
-
-        # Combine the outputs
-        output_1 = self.layer_norm(x1 + cross_attn_output_1)
-        output_2 = self.layer_norm(x2 + cross_attn_output_2)
-
-        return output_1, output_2
-    
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
-        super(MultiHeadAttention, self).__init__()
-        self.num_heads = num_heads
-        self.dim_per_head = model_dim // num_heads
-        
-        self.linear_q = nn.Linear(model_dim, model_dim)
-        self.linear_k = nn.Linear(model_dim, model_dim)
-        self.linear_v = nn.Linear(model_dim, model_dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.softmax = nn.Softmax(dim=-1)
-        self.linear_out = nn.Linear(model_dim, model_dim)
-        
-    def forward(self, query, key, value, mask=None):
-        batch_size = query.size(0)
-        
-        query = self.linear_q(query).view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
-        key = self.linear_k(key).view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
-        value = self.linear_v(value).view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
-        
-        scores = torch.matmul(query, key.transpose(-2, -1)) / (self.dim_per_head ** 0.5)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        attn = self.softmax(scores)
-        attn = self.dropout(attn)
-        
-        context = torch.matmul(attn, value).transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.dim_per_head)
-        output = self.linear_out(context)
-        
-        return output
-
-
-def adaptive_resize(tensor, target_len):
-    return F.adaptive_avg_pool2d(tensor.transpose(1, 2), (target_len, tensor.size(2)))
-
-class CoAttention(nn.Module):
-    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
-        super(CoAttention, self).__init__()
-        self.attention1 = MultiHeadAttention(model_dim, num_heads, dropout)
-        self.attention2 = MultiHeadAttention(model_dim, num_heads, dropout)
-        self.linear_out = nn.Linear(2 * model_dim, model_dim)
-        self.layer_norm = nn.LayerNorm(model_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x1, x2, mask1=None, mask2=None):
-        attn_output1 = self.attention1(x1, x2, x2, mask2)
-        attn_output2 = self.attention2(x2, x1, x1, mask1)
-        
-        combined_1 = torch.cat([attn_output1.mean(dim=1), attn_output2.mean(dim=1)], dim=-1)
-        output_1 = self.dropout(self.linear_out(combined_1))
-        output_1 = self.layer_norm(output_1)
-        
-        attn_output2_new = adaptive_resize(attn_output2, x1.size(1))
-
-        combined_2 = torch.cat([attn_output1, attn_output2_new], dim=-1)
-        
-        output_2 = self.dropout(self.linear_out(combined_2))
-        output_2 = self.layer_norm(output_2)
-        
-        return output_1, output_2
-    
 
 class SimpleSeqEncoder(nn.Module):
     """
@@ -570,3 +402,276 @@ class CrossDecoder(nn.Module):
         return self.net(z)
     
 
+####################################### EARAM #############################################
+def masked_mean(x, mask):
+    # x: (B, L, D), mask: (B, L)  1 有效, 0 padding
+    mask = mask.unsqueeze(-1)          # (B, L, 1)
+    x = x * mask                       # padding 位置置 0
+    denom = mask.sum(dim=1, keepdim=True).clamp(min=1e-6)  # (B, 1, 1)
+    return x.sum(dim=1) / denom.squeeze(1)                 # (B, D)
+
+class multimodal_attention(nn.Module):
+    """
+    dot-product attention mechanism
+    """
+
+    def __init__(self, attention_dropout=0.5):
+        super(multimodal_attention, self).__init__()
+        self.dropout = nn.Dropout(attention_dropout)
+        self.softmax = nn.Softmax(dim=2)
+
+    def forward(self, q, k, v, scale=None, attn_mask=None):
+
+        attention = torch.matmul(q, k.transpose(-2, -1))
+        # print('attention.shape:{}'.format(attention.shape))
+        if scale is not None:
+            attention = attention * scale
+        # pdb.set_trace()
+        if attn_mask is not None:
+            attn_mask = (attn_mask == 0)
+            if attn_mask.dim() == 2:
+                # (B, Lk) -> (B, 1, 1, Lk)，在 heads 和 query_len 上广播
+                attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+            elif attn_mask.dim() == 3:
+                # (B, Lq, Lk) -> (B, 1, Lq, Lk)，在 heads 维上广播
+                attn_mask = attn_mask.unsqueeze(1)
+            attention = attention.masked_fill_(attn_mask, -np.inf)
+            
+        attention = self.softmax(attention)
+        # print('attention.shftmax:{}'.format(attention))
+        attention = self.dropout(attention)
+        v_result = torch.matmul(attention, v)
+        # print('attn_final.shape:{}'.format(attention.shape))
+
+        return v_result
+    
+class CrossAttention(nn.Module):
+    """
+    Multi-Head Cross Attention mechanism
+    """
+
+    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
+        super(CrossAttention, self).__init__()
+
+        self.model_dim = model_dim
+        self.dim_per_head = model_dim // num_heads
+        self.num_heads = num_heads
+
+        self.linear_q = nn.Linear(model_dim, self.dim_per_head * num_heads, bias=False)
+        self.linear_k = nn.Linear(model_dim, self.dim_per_head * num_heads, bias=False)
+        self.linear_v = nn.Linear(model_dim, self.dim_per_head * num_heads, bias=False)
+
+        self.dot_product_attention = multimodal_attention(dropout)
+        self.linear_final = nn.Linear(model_dim, model_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(model_dim)
+
+    def forward(self, query, key, value, attn_mask=None):
+        residual = query
+
+        # Linear projection
+        query = self.linear_q(query)
+        key = self.linear_k(key)
+        value = self.linear_v(value)
+
+        # Split by heads
+        batch_size = query.size(0)
+        query = query.view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
+        key = key.view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
+        value = value.view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
+
+        # Scaled dot product attention
+        scale = (self.dim_per_head) ** -0.5
+        attention = self.dot_product_attention(query, key, value, scale, attn_mask)
+
+        # Concatenate heads
+        attention = attention.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.dim_per_head)
+
+        # Final linear projection
+        output = self.linear_final(attention)
+
+        # Dropout
+        output = self.dropout(output)
+
+        # Add residual and norm layer
+        output = self.layer_norm(residual + output)
+
+        return output
+    
+
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
+        super(MultiHeadCrossAttention, self).__init__()
+
+        self.model_dim = model_dim
+        self.dim_per_head = model_dim // num_heads
+        self.num_heads = num_heads
+
+        self.cross_attention = CrossAttention(model_dim, num_heads, dropout)
+        self.layer_norm = nn.LayerNorm(model_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x1, x2, attn_mask_1=None, attn_mask_2=None):
+        # Cross attention from x1 to x2
+        cross_attn_output_1 = self.cross_attention(x1, x2, x2, attn_mask_2)
+        # Cross attention from x2 to x1
+        cross_attn_output_2 = self.cross_attention(x2, x1, x1, attn_mask_1)
+
+        # Combine the outputs
+        output_1 = self.layer_norm(x1 + cross_attn_output_1)
+        output_2 = self.layer_norm(x2 + cross_attn_output_2)
+
+        return output_1, output_2
+    
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, model_dim=768, num_heads=8, dropout=0.3, use_ffn=False):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.dim_per_head = model_dim // num_heads
+
+        self.linear_q = nn.Linear(model_dim, model_dim)
+        self.linear_k = nn.Linear(model_dim, model_dim)
+        self.linear_v = nn.Linear(model_dim, model_dim)
+        self.out_proj = nn.Linear(model_dim, model_dim)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.use_ffn = use_ffn
+        if use_ffn:
+            self.ffn = nn.Sequential(
+                nn.Linear(model_dim, 4 * model_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(4 * model_dim, model_dim),
+            )
+            self.ffn_dropout = nn.Dropout(dropout)
+            self.norm2 = nn.LayerNorm(model_dim)
+
+        self.norm1 = nn.LayerNorm(model_dim)
+
+    def forward(self, query, key, value, mask=None):
+        batch_size = query.size(0)
+
+        q = self.linear_q(query).view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
+        k = self.linear_k(key).view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
+        v = self.linear_v(value).view(batch_size, -1, self.num_heads, self.dim_per_head).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.dim_per_head ** 0.5)
+        if mask is not None:
+            # 支持 mask 形状为 (B, key_len) 或 (B, query_len, key_len) 或已是 4D
+            if mask.dim() == 2:
+                # (B, Lk) -> (B, 1, 1, Lk)，在 heads 和 query_len 上广播
+                mask = mask.unsqueeze(1).unsqueeze(2)
+            elif mask.dim() == 3:
+                # (B, Lq, Lk) -> (B, 1, Lq, Lk)，在 heads 维上广播
+                mask = mask.unsqueeze(1)
+            # 此时 mask 应该能与 scores (B, num_heads, Lq, Lk) 广播
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        attn = self.softmax(scores)
+        attn = self.attn_dropout(attn)
+
+        context = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.dim_per_head)
+        attn_out = self.out_proj(context)
+        attn_out = self.proj_dropout(attn_out)
+
+        x = self.norm1(query + attn_out)
+
+        if self.use_ffn:
+            ff = self.ffn(x)
+            ff = self.ffn_dropout(ff)
+            x = self.norm2(x + ff)
+
+        return x
+
+
+def adaptive_resize(tensor, target_len):
+    return F.adaptive_avg_pool2d(tensor.transpose(1, 2), (target_len, tensor.size(2)))
+
+class CoAttention(nn.Module):
+    def __init__(self, model_dim=768, num_heads=8, dropout=0.5):
+        super(CoAttention, self).__init__()
+        self.attention1 = MultiHeadAttention(model_dim, num_heads, dropout)
+        self.attention2 = MultiHeadAttention(model_dim, num_heads, dropout)
+        self.linear_out = nn.Linear(2 * model_dim, model_dim)
+        self.layer_norm = nn.LayerNorm(model_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x1, x2, mask1=None, mask2=None):
+        attn_output1 = self.attention1(x1, x2, x2, mask2)
+        attn_output2 = self.attention2(x2, x1, x1, mask1)
+        
+        if mask1 is not None:
+            pooled1 = masked_mean(attn_output1, mask1)   # (B, D)
+        else:
+            pooled1 = attn_output1.mean(dim=1)
+
+        if mask2 is not None:
+            pooled2 = masked_mean(attn_output2, mask2)   # (B, D)
+        else:
+            pooled2 = attn_output2.mean(dim=1)    
+
+        combined_1 = torch.cat([pooled1, pooled2], dim=-1)
+        output_1 = self.dropout(self.linear_out(combined_1))
+        output_1 = self.layer_norm(output_1)
+        
+        attn_output2_new = adaptive_resize(attn_output2, x1.size(1))
+
+        combined_2 = torch.cat([attn_output1, attn_output2_new], dim=-1)
+        
+        output_2 = self.dropout(self.linear_out(combined_2))
+        output_2 = self.layer_norm(output_2)
+        
+        if mask1 is not None:
+            output_2 = output_2 * mask1.unsqueeze(-1)   # (B, L1, D) * (B, L1, 1)
+
+        return output_1, output_2
+    
+
+class EARAM_MLP(nn.Module):
+    def __init__(self, in_features, out_features =2, hidden_size=256, dropout=0.5):
+        super(EARAM_MLP, self).__init__()
+        self.linear1 = nn.Linear(in_features, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(hidden_size, out_features)
+        self.activation = nn.ReLU()
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return x
+    
+class simple_mlp(nn.Module):
+    def __init__(self,in_features,out_features =2, hidden_size=256, dropout= 0.5):
+        super(simple_mlp,self).__init__()
+        self.linear1 = nn.Linear(in_features, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(hidden_size, out_features)
+        self.activation = nn.ReLU()
+
+    def forward(self, x):
+        x = x.mean(dim=1)
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        x = F.softmax(x, dim=-1)
+        return x
+    
+
+# class mm_fusion(nn.Module):
+#     def __init__(self, dim, num_heads=8, dropout=0.5):
+#         super(mm_fusion, self).__init__()
+#         self.cross_layer = MultiHeadCrossAttention(model_dim=dim, num_heads=num_heads, dropout=dropout)
+#         self.co_layer = CoAttention(model_dim=dim, num_heads=num_heads, dropout=dropout)
+
+#     def forward(self, x1, x2, mask1=None, mask2=None):
+#         x1, x2 = self.cross_layer(x1, x2, mask1, mask2)
+#         fusion_1,fusion_high_dim = self.co_layer(x1, x2, mask1, mask2)
+
+#         return fusion_1,fusion_high_dim

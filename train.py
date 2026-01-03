@@ -24,9 +24,9 @@ def parse_args():
     parser.add_argument('--root_path', type=str, help='Root path of dataset')
     parser.add_argument('--data_name', type=str, default='weibo', help='Name of dataset (e.g., weibo, gossip)')
     parser.add_argument('--image_root', type=str, default='/data01/qy/fakenews/Dataset/weibo', help='Root path for images')
-    
     # K-Fold Params
     parser.add_argument('--k_folds', type=int, default=0, help='Number of folds for K-Fold Cross Validation. 0 or 1 to disable.')
+    parser.add_argument('--kfold_path', type=str, default=None, help='Path to kfold split file (JSON)')
 
     # Model Params
     parser.add_argument('--model_name', type=str, default='MM', help='Model architecture name')
@@ -89,63 +89,60 @@ def load_config_from_file(config_path: str) -> dict:
 def run_kfold(args, logger, base_config):
     logger.info(f"Starting {args.k_folds}-Fold Cross Validation")
     
-    # Load original train data
-    train_path = os.path.join(args.root_path, 'train.jsonl')
-
-    data = []
-    labels = []
-    with open(train_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if not line.strip(): continue
-            item = json.loads(line)
-            data.append(item)
-            # Use raw label for stratification
-            # Normalize labels using the same logic as dataset.py
-            raw_label = item['label']
-            # label_map from dataset.py: {"real": 0, "fake": 1, 0: 1, 1: 0}
-            if raw_label == "real": label = 0
-            elif raw_label == "fake": label = 1
-            elif raw_label == 0: label = 1
-            elif raw_label == 1: label = 0
-            else: label = 0
-            labels.append(label)
-            
-    skf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
-    
     # Base output dir for kfold (use the timestamp dir created in main)
     exp_dir = base_config['save_log_dir'].replace('/logs', '') 
     
+    splits = []
+    if args.kfold_path and os.path.exists(args.kfold_path):
+        logger.info(f"Loading k-fold splits from {args.kfold_path}")
+        with open(args.kfold_path, 'r') as f:
+            splits = json.load(f)
+        if len(splits) != args.k_folds:
+             logger.warning(f"Loaded splits count ({len(splits)}) does not match k_folds ({args.k_folds}). Using loaded count.")
+             args.k_folds = len(splits)
+    else:
+        # Load original train data to generate splits
+        train_path = os.path.join(args.root_path, 'train.jsonl')
+        data = []
+        labels = []
+        with open(train_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip(): continue
+                item = json.loads(line)
+                data.append(item)
+                # Use raw label for stratification
+                label = int(item['label'])
+                if label != 0 and label != 1:
+                    raise ValueError(f"label is not 0/1 ! {label}")
+                labels.append(label)
+                
+        skf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
+        
+        for train_idx, val_idx in skf.split(data, labels):
+            splits.append({
+                "train_indices": train_idx.tolist(),
+                "val_indices": val_idx.tolist()
+            })
+            
+        # Save splits
+        split_save_path = os.path.join(exp_dir, 'kfold_splits.json')
+        with open(split_save_path, 'w') as f:
+            json.dump(splits, f, indent=4)
+        logger.info(f"Saved k-fold splits to {split_save_path}")
+    
     fold_results = []
     
-    for fold, (train_idx, val_idx) in enumerate(skf.split(data, labels)):
+    for fold, split in enumerate(splits):
         fold_num = fold + 1
         logger.info(f"========== Processing Fold {fold_num}/{args.k_folds} ==========")
         
         fold_dir = os.path.join(exp_dir, f'fold_{fold_num}')
         os.makedirs(fold_dir, exist_ok=True)
         
-        # Prepare data files
-        fold_train_data = [data[i] for i in train_idx]
-        fold_val_data = [data[i] for i in val_idx]
-        
-        with open(os.path.join(fold_dir, 'train.jsonl'), 'w', encoding='utf-8') as f:
-            for item in fold_train_data:
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                
-        with open(os.path.join(fold_dir, 'val.jsonl'), 'w', encoding='utf-8') as f:
-            for item in fold_val_data:
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
-        
-        # Symlink test.jsonl
-        src_test = os.path.join(args.root_path, 'test.jsonl')
-        dst_test = os.path.join(fold_dir, 'test.jsonl')
-        if os.path.exists(src_test):
-            if os.path.exists(dst_test): os.remove(dst_test)
-            os.symlink(os.path.abspath(src_test), dst_test)
-            
         # Config for this fold
         fold_config = base_config.copy()
-        fold_config['root_path'] = fold_dir
+        # Do NOT change root_path, keep it pointing to original data
+        # fold_config['root_path'] = fold_dir 
         
         # Update save dirs
         fold_config['save_log_dir'] = os.path.join(fold_dir, 'logs')
@@ -153,17 +150,23 @@ def run_kfold(args, logger, base_config):
         fold_config['tensorboard_dir'] = os.path.join(fold_dir, 'tensorboard')
         fold_config['test_save_path'] = os.path.join(fold_dir, 'test.json')
         
+        # Add indices
+        fold_config['train_indices'] = split['train_indices']
+        fold_config['val_indices'] = split['val_indices']
+        
         for d in [fold_config['save_log_dir'], fold_config['save_param_dir'], fold_config['tensorboard_dir']]:
             os.makedirs(d, exist_ok=True)
             
         # Dataloaders
         train_loader = create_dataloader(fold_config, mode='train')
         val_loader = create_dataloader(fold_config, mode='val')
+        
         test_path = os.path.join(args.root_path, 'test.jsonl')
         if os.path.exists(test_path):
             test_loader = create_dataloader(fold_config, mode='test')
         else:
             test_loader = None
+            
         # Trainer
         fold_logger = get_logger(fold_config['save_log_dir'], f'train_fold_{fold_num}')
         
@@ -231,80 +234,18 @@ def main():
                 existing = config.get(k, {})
                 merged = {**existing, **v}
                 config[k] = merged
+
     config['use_cuda'] = True
     config['save_log_dir'] = log_dir
     config['save_param_dir'] = param_dir
     config['tensorboard_dir'] = tensorboard_dir
-    # config['max_len'] = 170 # Hardcoded or add to args
     config['test_save_path'] = test_save_path
-    # pdb.set_trace()
-    # Model specific config structure (to match original model expectations)
-    # if config['model_name'] == "distangle":
-    #     config['model'] = {
-    #         'mlp': {'dims': [384], 'dropout': 0.2},
-    #         'align_weight': args.align_weight,
-    #         'self_re_weight': args.self_re_weight,
-    #         'cross_re_weight': args.cross_re_weight,
-    #         'z_dim': args.z_dim,
-    #         'w_dim': args.w_dim
-    #     }
-    # elif config['model_name'] == 'distangle_1':
-    #     config['model'] = {
-    #         'num_heads': 8,
-    #         'embed_dim': 128,
-    #         'conv1d_kernel_size_m': 3,
-    #         'conv1d_kernel_size_r': 5,
-    #         'layer': {
-    #             'encoder': 2,
-    #             'cross_query': 2,
-    #             'mm': 2,
-    #             'mr': 2,
-    #             'shared': 2,
-    #             'm_self': 2,
-    #             'r_self': 2,
-    #             'r_p': 2,
-    #         },
-    #         'drop_out':{
-    #             'output': 0.5,
-    #             'encoder': 0.3,
-    #             'cross_query': 0.3,
-    #             'mm': 0.3,
-    #             'mr': 0.3,
-    #             'shared': 0.3,
-    #             'm_self': 0.3,
-    #             'r_self': 0.3,
-    #             'r_p': 0.3,
-    #             'attn':{
-    #                 'relu': 0.0,
-    #                 'res': 0.0,
-    #                 'embed': 0.2,
-    #             }
-    #         },
-    #         'hyper_parameters':{
-    #             # 'cls': {'mm': 0.5, 'r1': 0.5, 'r2': 0.5, 'shared': 0.5},
-    #             'cls': 0.5,
-    #             'recon_origin': 0.1,
-    #             'recon_specific': 0.1,
-    #             'ort': 0.1,
-    #             'contrastive': 0.1
-    #         }
-    #     }
-    # else:
-    #     config['model'] = {
-    #         'mlp': {'dims': [384], 'dropout': 0.2},
-    #         'llm_judgment_predictor_weight': args.llm_judgment_predictor_weight,
-    #         'rationale_usefulness_evaluator_weight': args.rationale_usefulness_evaluator_weight,
-    #         'kd_loss_weight': args.kd_loss_weight,
-    #         'evidential_error_weight': args.evidential_error_weight,
-    #     }
 
-
-    
     # Save Config
     with open(os.path.join(timestamp, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
-    if args.k_folds > 1:
+    if args.k_folds > 1 or args.kfold_path:
         run_kfold(args, logger, config)
         return
 
